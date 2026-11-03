@@ -1,0 +1,11 @@
+# Build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Local captures (do not commit driver images)
+*.bin
+*.dmp
+mvci_unpacked.bin
