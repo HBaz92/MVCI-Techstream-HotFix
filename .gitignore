@@ -9,3 +9,13 @@ __pycache__/
 *.bin
 *.dmp
 mvci_unpacked.bin
+
+# Packaging / transport archives (never commit these)
+*.zip
+
+# Logs
+*.log
+loglog.txt
+
+# Local Techstream install (vendor software - never commit)
+Techstream version 16/

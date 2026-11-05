@@ -26,6 +26,15 @@ The fix (applied after the packed DLL has unpacked itself in memory):
          re-issues the request. No crash, no hang; at worst one reading is
          skipped and the next cycle recovers.
      Otherwise it resumes the original copy loop at RVA 0x138E unchanged.
+  3. RVA 0x39CF (inside PassThruReadVersion): the version routine calls the
+     0x1300 read, then copies `length` bytes from the accumulation buffer into
+     a small (~0x32-byte) version buffer with the loop at RVA 0x39E0, using the
+     returned length as the bound WITHOUT clamping it. On a desync the read
+     returns a garbage length (0x10290 seen in the crash dump) and the loop
+     runs off the end of the source buffer -> access violation at MVCI32+0x39E0.
+     The call itself requested at most 0x32 bytes (push 32h), so clamp the
+     stored length to 0x32 before the loop. Legitimate versions (<= 0x32) are
+     unaffected; a garbage length is capped and the read is skipped, not crashed.
 
 Nothing on disk is modified. Run as Administrator, leave it running, then
 start Techstream and connect to the vehicle.
@@ -69,6 +78,19 @@ LOOP_ORIG = bytes.fromhex("8b4c241c" "40" "8a4c08ff" "884c02ff")
 
 CHECK_START = READ_SIZE_RVA
 CHECK_END = RESUME_RVA + len(LOOP_ORIG)
+
+# --- Fix 2: PassThruReadVersion copy-loop overflow (function at RVA 0x38D0) ---
+# After calling 0x1300, the version routine runs a byte copy loop at RVA 0x39E0
+# bounded by the returned length at [esp+10h], with no clamp. A desynced read
+# returns a garbage length, so the loop reads past the source buffer and faults
+# at MVCI32+0x39E0 (confirmed: eax=0x10290, esi=src, [eax+esi] unmapped). The
+# call requested at most 0x32 bytes, so clamp the stored length to 0x32 first.
+VER_HOOK_RVA = 0x39CF
+VER_HOOK_ORIG = bytes.fromhex("8b4c2410" "8b542450")  # mov ecx,[esp+10h]; mov edx,[esp+50h]
+VER_HOOK_LEN = len(VER_HOOK_ORIG)                      # 8 bytes overwritten
+VER_RESUME_RVA = 0x39D7                                # mov eax,1 (first byte after the hook)
+VER_MAXLEN = 0x32                                      # requested max (arg4 = push 32h)
+VER_LEN_STK_OFF = 0x10                                 # [esp+10h] = returned-length slot
 
 
 def build_stub(stub_addr: int, resume_addr: int, abort_addr: int) -> bytes:
@@ -129,6 +151,38 @@ def build_stub(stub_addr: int, resume_addr: int, abort_addr: int) -> bytes:
 def build_hook(hook_addr: int, stub_addr: int) -> bytes:
     rel = (stub_addr - (hook_addr + 5)) & 0xFFFFFFFF
     return b"\xe9" + struct.pack("<I", rel) + b"\x90" * (HOOK_LEN - 5)
+
+
+def build_ver_stub(stub_addr: int, resume_addr: int) -> bytes:
+    """x86 code executed instead of RVA 0x39CF..0x39D6.
+
+    Clamp the version length at [esp+10h] to VER_MAXLEN, replay the two
+    displaced instructions (mov ecx,[esp+10h]; mov edx,[esp+50h]), then jump
+    back to RVA 0x39D7. Reached by a jmp (esp unchanged), so [esp+10h] and
+    [esp+50h] are exactly the slots the original code reads. The loop at 0x39E0
+    re-reads [esp+10h] every iteration, so clamping the stored value (not just a
+    register) is what bounds the copy.
+    """
+    maxb = struct.pack("<B", VER_MAXLEN)
+    maxd = struct.pack("<I", VER_MAXLEN)
+    off = struct.pack("<B", VER_LEN_STK_OFF)
+    code = bytearray()
+    code += b"\x83\x7c\x24" + off + maxb   # cmp  dword ptr [esp+10h], 32h
+    code += bytes.fromhex("7608")          # jbe  +8  (length already <= 32h)
+    code += b"\xc7\x44\x24" + off + maxd   # mov  dword ptr [esp+10h], 32h
+    code += bytes.fromhex("8b4c2410")      # mov  ecx, [esp+10h]   (displaced)
+    code += bytes.fromhex("8b542450")      # mov  edx, [esp+50h]   (displaced)
+    jmp_at = len(code)
+    code += b"\x00" * 5                     # placeholder: jmp resume
+    code[jmp_at] = 0xE9
+    code[jmp_at + 1:jmp_at + 5] = struct.pack(
+        "<I", (resume_addr - (stub_addr + jmp_at + 5)) & 0xFFFFFFFF)
+    return bytes(code)
+
+
+def build_ver_hook(hook_addr: int, stub_addr: int) -> bytes:
+    rel = (stub_addr - (hook_addr + 5)) & 0xFFFFFFFF
+    return b"\xe9" + struct.pack("<I", rel) + b"\x90" * (VER_HOOK_LEN - 5)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +330,52 @@ def find_module(pid: int):
     return None
 
 
+# Other modules worth reporting (e.g. the J2534 proxy shim), so one run shows
+# whether Techstream actually loaded them, live in this window.
+WATCH_MODULES = ("j2534_proxy.dll",)
+
+
+def enumerate_modules(pid: int):
+    """Return {lowercased module name: (base, size, path)} for a process."""
+    for _ in range(5):
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
+        if snap not in (None, INVALID_HANDLE_VALUE):
+            break
+        if ctypes.get_last_error() != ERROR_BAD_LENGTH:
+            return {}
+        time.sleep(0.05)
+    else:
+        return {}
+    out = {}
+    try:
+        entry = MODULEENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Module32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            out[entry.szModule.lower()] = (entry.modBaseAddr, entry.modBaseSize, entry.szExePath)
+            ok = kernel32.Module32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return out
+
+
+def report_watched(states: dict, pid: int, exe: str, mods: dict) -> None:
+    """Log, once per change, whether each watched module is loaded in a process."""
+    for name in WATCH_MODULES:
+        key = ("watch", pid, name)
+        m = mods.get(name)
+        if m:
+            base, _size, path = m
+            if states.get(key) != "loaded":
+                log(f"{name}: LOADED in {exe} (PID {pid}) @ 0x{base:08X} from {path}")
+                states[key] = "loaded"
+        elif states.get(key) == "loaded":
+            log(f"{name}: unloaded from {exe} (PID {pid})")
+            states[key] = "absent"
+        else:
+            states[key] = "absent"
+
+
 def dump_module(handle, base: int, size: int, path: str):
     """Read the whole in-memory (unpacked) module image to a file.
 
@@ -362,11 +462,20 @@ def classify(region: bytes) -> str:
     return STATE_UNKNOWN
 
 
-def apply_patch(handle, base: int, stubs: dict, key) -> int:
+def classify_ver(region: bytes) -> str:
+    """State of the PassThruReadVersion hook site (8 bytes at RVA 0x39CF)."""
+    if region == VER_HOOK_ORIG:
+        return STATE_ORIGINAL
+    if region and region[0] == 0xE9:
+        return STATE_PATCHED
+    return STATE_UNKNOWN
+
+
+def apply_patch(handle, base: int, stubs_for_key: dict) -> int:
     resume_addr = base + RESUME_RVA
     abort_addr = base + ABORT_RVA
     hook_addr = base + HOOK_RVA
-    stub_addr = stubs.get(key)
+    stub_addr = stubs_for_key.get("main")
     if stub_addr is not None:
         expected = build_stub(stub_addr, resume_addr, abort_addr)
         if read_mem(handle, stub_addr, len(expected)) != expected:
@@ -374,9 +483,25 @@ def apply_patch(handle, base: int, stubs: dict, key) -> int:
     if stub_addr is None:
         stub_addr = alloc_stub(handle)
         write_code(handle, stub_addr, build_stub(stub_addr, resume_addr, abort_addr))
-        stubs[key] = stub_addr
+        stubs_for_key["main"] = stub_addr
     write_code(handle, base + READ_SIZE_RVA, READ_SIZE_NEW)
     write_code(handle, hook_addr, build_hook(hook_addr, stub_addr))
+    return stub_addr
+
+
+def apply_ver_patch(handle, base: int, stubs_for_key: dict) -> int:
+    resume_addr = base + VER_RESUME_RVA
+    hook_addr = base + VER_HOOK_RVA
+    stub_addr = stubs_for_key.get("ver")
+    if stub_addr is not None:
+        expected = build_ver_stub(stub_addr, resume_addr)
+        if read_mem(handle, stub_addr, len(expected)) != expected:
+            stub_addr = None
+    if stub_addr is None:
+        stub_addr = alloc_stub(handle)
+        write_code(handle, stub_addr, build_ver_stub(stub_addr, resume_addr))
+        stubs_for_key["ver"] = stub_addr
+    write_code(handle, hook_addr, build_ver_hook(hook_addr, stub_addr))
     return stub_addr
 
 
@@ -389,12 +514,16 @@ def report(states: dict, key, state: str, text: str) -> None:
 def process_once(states: dict, stubs: dict, check_only: bool) -> int:
     seen = 0
     for pid, exe in iter_target_processes():
-        module = find_module(pid)
+        mods = enumerate_modules(pid)
+        report_watched(states, pid, exe, mods)
+        module = mods.get(TARGET_MODULE)
         if not module:
             continue
         base, _size, _path = module
         seen += 1
         key = (pid, base)
+        vkey = (pid, base, "ver")
+        stubs_for_key = stubs.setdefault(key, {})
         tag = f"{exe} (PID {pid}) MVCI32.dll @ 0x{base:08X}"
         if states.get(key) == STATE_ERROR:
             continue
@@ -406,20 +535,34 @@ def process_once(states: dict, stubs: dict, check_only: bool) -> int:
         try:
             region = read_mem(handle, base + CHECK_START, CHECK_END - CHECK_START)
             state = classify(region) if region else STATE_WAITING
+            # Fix 1: Data List overflow (read routine at RVA 0x1300).
             if state == STATE_ORIGINAL and not check_only:
-                stub = apply_patch(handle, base, stubs, key)
+                stub = apply_patch(handle, base, stubs_for_key)
                 states[key] = STATE_PATCHED
-                log(f"{tag}: patched (stub @ 0x{stub:08X}). Data List is protected now.")
+                log(f"{tag}: Data List protected (stub @ 0x{stub:08X}).")
             elif state == STATE_ORIGINAL:
                 report(states, key, state, f"{tag}: original code found, patch can be applied (check mode).")
             elif state == STATE_PATCHED:
-                report(states, key, state, f"{tag}: already patched.")
+                report(states, key, state, f"{tag}: Data List already patched.")
             elif state == STATE_WAITING:
                 report(states, key, state,
                        f"{tag}: loaded, waiting for the driver to unpack "
                        f"(if this never changes, the DLL version differs from the analysed one).")
             else:
                 report(states, key, state, f"{tag}: unexpected bytes at the patch site, left untouched.")
+            # Fix 2: PassThruReadVersion copy overflow (RVA 0x39CF) - only once unpacked.
+            if state in (STATE_ORIGINAL, STATE_PATCHED):
+                vregion = read_mem(handle, base + VER_HOOK_RVA, VER_HOOK_LEN)
+                vstate = classify_ver(vregion) if vregion else STATE_WAITING
+                if vstate == STATE_ORIGINAL and not check_only:
+                    vstub = apply_ver_patch(handle, base, stubs_for_key)
+                    report(states, vkey, STATE_PATCHED, f"{tag}: ReadVersion protected (stub @ 0x{vstub:08X}).")
+                elif vstate == STATE_ORIGINAL:
+                    report(states, vkey, STATE_ORIGINAL, f"{tag}: ReadVersion site found, can be patched (check mode).")
+                elif vstate == STATE_PATCHED:
+                    report(states, vkey, STATE_PATCHED, f"{tag}: ReadVersion already patched.")
+                else:
+                    report(states, vkey, STATE_UNKNOWN, f"{tag}: unexpected bytes at the ReadVersion site, left untouched.")
         except Exception as exc:
             states[key] = STATE_ERROR
             log(f"{tag}: patch failed: {exc}")
